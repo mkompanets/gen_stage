@@ -1,7 +1,7 @@
 alias Experimental.GenStage
 
 defmodule GenStage do
-  @moduledoc """
+  @moduledoc ~S"""
   Stages are computation steps that send and/or receive data
   from other stages.
 
@@ -28,7 +28,7 @@ defmodule GenStage do
 
     * A is only a producer (and therefore a source)
     * B is both producer and consumer
-    * C is only consumer (and therefore a sink)
+    * C is only a consumer (and therefore a sink)
 
   As we will see in the upcoming Examples section, we must
   specify the type of the stage when we implement each of them.
@@ -86,7 +86,7 @@ defmodule GenStage do
   its producer. Once A receives the demand from B, it will send
   events to B which will be transformed by B as desired. In
   our case, B will receive events and multiply them by a number
-  giving on initialization and stored as the state:
+  given on initialization and stored as the state:
 
       defmodule B do
         use GenStage
@@ -158,27 +158,303 @@ defmodule GenStage do
   50 seconds to be consumed by C, which will then request another
   batch of 50 items.
 
-  ## Buffer events
+  ## Buffering
 
-  Due to the concurrent nature of Elixir software, sometimes
-  a producer may receive events without consumers to send those
-  events to. For example, imagine a consumer C subscribes to
-  producer B. Next, the consumer C sends demand to B, which sends
-  the demand upstream. Now, if the consumer C crashes, B may
-  receive the events from upstream but it no longer has a consumer
-  to send those events to. In such cases, B will buffer the events
-  which have arrived from upstream.
+  In many situations, producers may attempt to emit events while no consumers
+  have yet subscribed. Similarly, consumers may ask producers for events
+  that are not yet available. In such cases, it is necessary for producers
+  to buffer events until a consumer is available or buffer the consumer
+  demand until events arrive, respectively. As we will see next, buffering
+  events can be done automatically by GenStage, while buffering the demand
+  is a case that must be explicitly considered by developers implementing
+  producers.
+
+  ### Buffering events
+
+  Due to the concurrent nature of Elixir software, sometimes a producer
+  may dispatch events without consumers to send those events to. For example,
+  imagine a `:consumer` B subscribes to `:producer` A. Next, the consumer B
+  sends demand to A, which uses to start producing events. Now, if the
+  consumer B crashes, the producer may attempt to dispatch the now produced
+  events but it no longer has a consumer to send those events to. In such
+  cases, the producer will automatically buffer the events until another
+  consumer subscribes.
 
   The buffer can also be used in cases external sources only send
   events in batches larger than asked for. For example, if you are
   receiving events from an external source that only sends events
   in batches of 1000 in 1000 and the internal demand is smaller than
-  that.
+  that, the buffer allows you to always emit batches of 1000 events
+  even when the consumer has asked for less.
 
-  In all of those cases, if the message cannot be sent immediately,
-  it is stored and sent whenever there is an opportunity to. The
-  size of the buffer is configured via the `:buffer_size` option
-  returned by `init/1`. The default value is 10000.
+  In all of those cases when an event cannot be sent immediately by
+  a producer, the event will be automatically stored and sent the next
+  time consumers ask for events. The size of the buffer is configured
+  via the `:buffer_size` option returned by `init/1` and the default
+  value is 10000. If the `buffer_size` is exceeded, an error is logged.
+
+  ### Buffering demand
+
+  In case consumers send demand and the producer is not yet ready to
+  fill in the demand, producers must buffer the demand until data arrives.
+
+  As an example, let's implement a producer that broadcasts messages
+  to consumers. For producers, we need to consider two scenarios:
+
+    1. what if events arrive and there are no consumers?
+    2. what if consumers send demand and there are not enough events?
+
+  One way to implement such broadcaster is to simply rely on the internal
+  buffer available in GenStage, dispatching events as they arrive, as explained
+  in the previous section:
+
+      defmodule NaiveBroadcaster do
+        use GenStage
+
+        @doc "Starts the broadcaster."
+        def start_link() do
+          GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+        end
+
+        @doc "Sends an event and returns only after the event is dispatched."
+        def sync_notify(pid, event, timeout \\ 5000) do
+          GenStage.call(__MODULE__, {:notify, event}, timeout)
+        end
+
+        def init(:ok) do
+          {:producer, :ok, dispatcher: GenStage.BroadcastDispatcher}
+        end
+
+        def handle_call({:notify, event}, _from, state) do
+          {:reply, :ok, [event], state} # Dispatch immediately
+        end
+
+        def handle_demand(_demand, state) do
+          {:noreply, [], state} # We don't care about the demand
+        end
+      end
+
+  By always sending events as soon as they arrive, if there is any demand,
+  we will serve the existing demand, otherwise the event will be queue in
+  GenStage's internal buffer.
+
+  While the implementation above is enough to solve the constraints above,
+  a more robust implementation would have tighter control over the events
+  and demand by tracking this data locally, leaving the GenStage internal
+  buffer only for cases where consumers crash without consuming all data.
+
+  To handle such cases, we will make the broadcaster state a tuple with
+  two elements: a queue and the pending demand. When events arrive and
+  there are no consumers, we store the event in the queue alongside the
+  process information that broadcasted the event. When consumers send
+  demand and there are not enough events, we increase the pending demand.
+  Once we have both the data and the demand, we acknowledge the process
+  that has sent the event to the broadcaster and finally broadcast the
+  event downstream.
+
+      defmodule Broadcaster do
+        use GenStage
+
+        @doc "Starts the broadcaster."
+        def start_link() do
+          GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+        end
+
+        @doc "Sends an event and returns only after the event is dispatched."
+        def sync_notify(pid, event, timeout \\ 5000) do
+          GenStage.call(__MODULE__, {:notify, event}, timeout)
+        end
+
+        ## Callbacks
+
+        def init(:ok) do
+          {:producer, {:queue.new, 0}, dispatcher: GenStage.BroadcastDispatcher}
+        end
+
+        def handle_call({:notify, event}, from, {queue, pending_demand}) do
+          queue = :queue.in({from, event}, queue)
+          dispatch_events(queue, pending_demand, [])
+        end
+
+        def handle_demand(incoming_demand, {queue, pending_demand}) do
+          dispatch_events(queue, incoming_demand + pending_demand, [])
+        end
+
+        defp dispatch_events(queue, 0, events) do
+          {:noreply, Enum.reverse(events), {queue, 0}}
+        end
+        defp dispatch_events(queue, demand, events) do
+          case :queue.out(queue) do
+            {{:value, {from, event}}, queue} ->
+              GenStage.reply(from, :ok)
+              dispatch_events(queue, demand - 1, [event | events])
+            {:empty, queue} ->
+              {:noreply, Enum.reverse(events), {queue, demand}}
+          end
+        end
+      end
+
+  Let's also implement a consumer that automatically subscribes to the
+  broadcaster on `c:init/1`. The advantage of doing so on initialization
+  is that, if the consumer crashes while it is supervised, the subscription
+  is automatically reestablished when the supervisor restarts it.
+
+      defmodule Printer do
+        use GenStage
+
+        @doc "Starts the consumer."
+        def start_link() do
+          GenStage.start_link(__MODULE__, :ok)
+        end
+
+        def init(:ok) do
+          # Starts a permanent subscription to the broadcaster
+          # which will automatically start requesting items.
+          {:consumer, :ok, subscribe_to: [Broadcaster]}
+        end
+
+        def handle_events(events, _from, state) do
+          for event <- events do
+            IO.inspect {self(), event}
+          end
+          {:noreply, [], state}
+        end
+      end
+
+  With the broadcaster in hand, now let's start the producer as well
+  as multiple consumers:
+
+      # Start the producer
+      Broadcaster.start_link()
+
+      # Start multiple consumers
+      Printer.start_link()
+      Printer.start_link()
+      Printer.start_link()
+      Printer.start_link()
+
+  At this point, all consumers must have sent their demand which we were
+  not able to fulfill. Now by calling `sync_notify`, the event shall be
+  broadcast to all consumers at once as we have buffered the demand in
+  the producer:
+
+      Broadcaster.sync_notify(:hello_world)
+
+  If we had called `Broadcaster.sync_notify(:hello_world)` before any
+  consumer was available, the event would also be buffered in our own
+  queue and served only demand arrived.
+
+  By having control over the demand and queue, the `Broadcaster` has
+  full control on how to behave when there are no consumers, when the
+  queue grows too large and so forth.
+
+  ## Asynchronous work and `handle_subscribe`
+
+  Both producer_consumer and consumer have been designed to do their
+  work in the `c:handle_events/3` callback. This means that, after
+  `c:handle_events/3` is invoked, both producer_consumer and consumer
+  will immediatally send demand upstream and ask for more items, as
+  it assumes events have been fully processed by `c:handle_event/3`.
+
+  Such default behaviour makes producer_consumer and consumer
+  unfeasable for doing asynchronous work. Fortunately, GenStage
+  comes with an option that allows developers to manually control
+  how demand is sent upstream, avoiding the default behaviour where
+  demand is sent after `c:handle_events/3`. Such can be done by
+  implementing the `c:handle_subscribe/4` callback and returning
+  `{:manual, state}` instead of the default `{:automatic, state}`.
+  Once the producer mode is set to `:manual`, developers must use
+  `GenStage.ask/3` to send demand upstream when necessary.
+
+  For example, the `DynamicSupervisor` module processes events
+  asynchronously by starting child process and such is done by
+  manully sending demand to producers. The `DynamicSupervisor`
+  can be used to keep distribute work to a limited amount of
+  processes, behaving similar to a pool where a new process is
+  started per event. The minimum amount of concurrent children per
+  producer is specified by `min_demand` and the `maximum` is given
+  by `max_demand`. See the `DynamicSupervisor` docs for more
+  information.
+
+  Setting the demand to `:manual` in `c:handle_subscribe/4` is not
+  only useful for asynchronous work but also for setting up other
+  mechanisms for back-pressure. As an example, let's implement a
+  consumer that is allowed to process a limited number of events
+  per time interval. Those are often called rate limitters:
+
+      defmodule RateLimiter do
+        use GenStage
+
+        def init(_) do
+          # Our state will keep all producers and their pending demand
+          {:consumer, %{}}
+        end
+
+        def handle_subscribe(:producer, opts, from, producers) do
+          # We will only allow max_demand events every 5000 miliseconds
+          pending = opts[:max_demand] || 1000
+          interval = opts[:interval] || 5000
+
+          # Register the producer in the state
+          producers = Map.put(producers, from, {pending, interval})
+          # Ask for the pending events and schedule the next time around
+          producers = ask_and_schedule(producers, from)
+
+          # Returns manual as we want control over the demand
+          {:manual, producers}
+        end
+
+        def handle_cancel(_, from, producers) do
+          # Remove the producers from the map on unsubscribe
+          {:noreply, [], Map.delete(producers, from)}
+        end
+
+        def handle_events(events, from, producers) do
+          # Bump the amount of pending events for the given producer
+          producers = Map.update!(producers, from, fn {pending, interval} ->
+            {pending + length(events), interval}
+          end)
+
+          # Consume the events by printing them.
+          IO.inspect(events)
+
+          # A producer_consumer would return the processed events here.
+          {:noreply, [], producers}
+        end
+
+        def handle_info({:ask, from}, producers) do
+          # This callback is invoked by the Process.send_after/3 message below.
+          {:noreply, [], ask_and_schedule(producers, from)}
+        end
+
+        defp ask_and_schedule(producers, from) do
+          case producers do
+            %{^from => {pending, interval}} ->
+              # Ask for any pending events
+              GenStage.ask(from, pending)
+              # And let's check again after interval
+              Process.send_after(self(), {:ask, from}, interval)
+              # Finally, reset pending events to 0
+              Map.put(producers, from, {0, interval})
+            %{} ->
+              producers
+          end
+        end
+      end
+
+  With the `RateLimiter` implemented, let's subscribe it to the
+  producer we have implemented at the beginning of the module
+  documentation:
+
+      {:ok, a} = GenStage.start_link(A, 0)
+      {:ok, b} = GenStage.start_link(RateLimiter, :ok)
+
+      # Ask for 10 items every 2 seconds
+      GenStage.sync_subscribe(b, to: a, max_demand: 10, interval: 2000)
+
+  Although the rate limiter above is a consumer, it could be made a
+  producer_consumer by changing `c:init/1` to return a `:producer_consumer`
+  and then forwarding the events in `c:handle_events/3`.
 
   ## Notifications
 
@@ -199,7 +475,7 @@ defmodule GenStage do
   `GenStage` is implemented on top of a `GenServer` with two additions.
   Besides exposing all of the `GenServer` callbacks, it also provides
   `handle_demand/2` to be implemented by producers and `handle_events/3`
-  to be implemented by consumers, as shown above. Futhermore, all the
+  to be implemented by consumers, as shown above. Furthermore, all the
   callback responses have been modified to potentially emit events.
   See the callbacks documentation for more information.
 
@@ -239,7 +515,7 @@ defmodule GenStage do
   than it has asked for from any given producer stage.
 
   A consumer may have multiple producers, where each demand is
-  managed invidually. A producer may have multiple consumers,
+  managed individually. A producer may have multiple consumers,
   where the demand and events are managed and delivered according
   to a `GenStage.Dispatcher` implementation.
 
@@ -257,7 +533,7 @@ defmodule GenStage do
       reference although it may be any term.
 
       Once sent, the consumer MAY immediately send demand to the producer.
-      The `subscription_ref` is unique to identify the subscription.
+      The `subscription_tag` is unique to identify the subscription.
 
       Once received, the producer MUST monitor the consumer. However, if
       the subscription reference is known, it MUST send a `:cancel` message
@@ -552,7 +828,7 @@ defmodule GenStage do
   @doc false
   defmacro __using__(_) do
     quote location: :keep do
-      @behaviour GenServer
+      @behaviour GenStage
 
       @doc false
       def handle_call(msg, _from, state) do
@@ -670,7 +946,7 @@ defmodule GenStage do
   that the consumers have received it.
 
   The given message will be delivered in the format
-  `{{producer_pid, subscription_ref}, msg}`, where `msg` is the message
+  `{{producer_pid, subscription_tag}, msg}`, where `msg` is the message
   given below.
 
   This function will return `:ok` as long as the notification request is
@@ -686,7 +962,7 @@ defmodule GenStage do
   Asks the producer to send a notification to all consumers asynchronously.
 
   The given message will be delivered in the format
-  `{{producer_pid, subscription_ref}, msg}`, where `msg` is the message
+  `{{producer_pid, subscription_tag}, msg}`, where `msg` is the message
   given below.
 
   This call returns `:ok` regardless if the notification has been
@@ -779,12 +1055,23 @@ defmodule GenStage do
   @doc """
   Asks the given demand to the producer.
 
-  This is an asynchronous request typically used
-  by consumers in `:manual` demand mode.
+  The demand is a non-negative integer with the amount of events to
+  ask a producer for. If the demand is 0, it simply returns `:ok`
+  without asking for data.
+
+  This function must only be used in the rare cases when a consumer
+  sets a subscription to `:manual` mode in the `c:handle_subscribe/4`
+  callback.
 
   It accepts the same options as `Process.send/3`.
   """
-  def ask({pid, ref}, demand, opts \\ []) when is_integer(demand) and demand > 0 do
+  def ask(producer, demand, opts \\ [])
+
+  def ask({_, _}, 0, _opts) do
+    :ok
+  end
+
+  def ask({pid, ref}, demand, opts) when is_integer(demand) and demand > 0 do
     Process.send(pid, {:"$gen_producer", {self(), ref}, {:ask, demand}}, opts)
     :ok
   end
@@ -924,7 +1211,7 @@ defmodule GenStage do
   When the enumerable finishes or halts, a notification is sent
   to all consumers in the format of
   `{{pid, subscription_tag}, {:producer, :halted | :done}}`. If the stage
-  is meant to terminate when there are no more consumers, we recomemnd
+  is meant to terminate when there are no more consumers, we recommend
   setting the `:consumers` option to `:permanent`.
 
   Keep in mind that streams that require the use of the process
@@ -945,12 +1232,12 @@ defmodule GenStage do
       a tuple with the dispatcher and the dispatcher options
 
     * `:demand` - configures the demand to `:forward` or `:accumulate`
-      mode. See `demand/2` for more information.
+      mode. See `c:init/1` and `demand/2` for more information.
 
   All other options that would be given for `start_link/3` are
   also accepted.
   """
-  @spec from_enumerable(Enumerable.t, Keyword.t) :: GenServer.on_start
+  @spec from_enumerable(Enumerable.t, keyword()) :: GenServer.on_start
   def from_enumerable(stream, opts \\ []) do
     case Keyword.pop(opts, :link, true) do
       {true, opts} -> start_link(GenStage.Streamer, {stream, opts}, opts)
@@ -966,7 +1253,8 @@ defmodule GenStage do
   represents the producer or a tuple with the producer and the
   subscription options as defined in `sync_subscribe/2`. Once
   all producers are subscribed to, their demand is automatically
-  set to `:forward` mode. See `demand/2` for more information.
+  set to `:forward` mode. See the `:demand` and `:producers`
+  options below for more information.
 
   `GenStage.stream/1` will "hijack" the inbox of the process
   enumerating the stream to subscribe and receive messages
@@ -975,6 +1263,18 @@ defmodule GenStage do
   except if one of the producers come from a remote node.
   For more information, read the "Known limitations" section
   below.
+
+  ## Options
+
+    * `:demand` - configures the demand to `:forward` or `:accumulate`
+      mode. See `c:init/1` and `demand/2` for more information.
+
+    * `:producers` - the processes to set the demand to `:forward`
+      on subscription. It defaults to the processes being subscribed
+      to. Sometimes the stream is subscribing to a `:producer_consumer`
+      instead of a `:producer`, in such cases, you can set this option
+      to either an empty list or the list of actual producers so they
+      receive the proper notification message.
 
   ## Known limitations
 
@@ -1001,7 +1301,7 @@ defmodule GenStage do
   consume such streams from a separate process which will be
   discarded after the stream is consumed.
   """
-  @spec stream([stage | {stage, Keyword.t}], keyword()) :: Enumerable.t
+  @spec stream([stage | {stage, keyword()}], keyword()) :: Enumerable.t
   def stream(subscriptions, options \\ [])
 
   def stream(subscriptions, options) when is_list(subscriptions) do
@@ -1015,10 +1315,10 @@ defmodule GenStage do
     raise ArgumentError, "GenStage.stream/1 expects a list of subscriptions, got: #{inspect subscriptions}"
   end
 
-  defp stream_validate_opts({to, full_opts}) when is_list(full_opts) do
-    with {:ok, cancel, opts} <- validate_in(full_opts, :cancel, :permanent, [:temporary, :permanent]),
-         {:ok, max, opts} <- validate_integer(opts, :max_demand, 1000, 1, :infinity, false),
-         {:ok, min, opts} <- validate_integer(opts, :min_demand, div(max, 2), 0, max - 1, false) do
+  defp stream_validate_opts({to, opts}) when is_list(opts) do
+    with {:ok, cancel, _} <- validate_in(opts, :cancel, :permanent, [:temporary, :permanent]),
+         {:ok, max, _} <- validate_integer(opts, :max_demand, 1000, 1, :infinity, false),
+         {:ok, min, _} <- validate_integer(opts, :min_demand, div(max, 2), 0, max - 1, false) do
       {to, cancel, min, max, opts}
     else
       {:error, message} ->
@@ -1028,6 +1328,26 @@ defmodule GenStage do
 
   defp stream_validate_opts(to) do
     stream_validate_opts({to, []})
+  end
+
+  defp init_stream(subscriptions, options) do
+    parent = self()
+
+    {monitor_pid, monitor_ref} =
+      spawn_monitor(fn -> init_monitor(parent, subscriptions) end)
+    send(monitor_pid, {parent, monitor_ref})
+
+    receive do
+      {:DOWN, ^monitor_ref, _, _, reason} ->
+        exit(reason)
+      {^monitor_ref, {:subscriptions, subscriptions}} ->
+        producers = options[:producers] || Enum.map(subscriptions, fn
+          {_, {:subscribed, pid, _, _, _, _}} -> pid
+        end)
+        demand = options[:demand] || :forward
+        for pid <- producers, do: demand(pid, demand)
+        {:receive, monitor_ref, subscriptions}
+    end
   end
 
   defp init_monitor(parent, subscriptions) do
@@ -1068,28 +1388,9 @@ defmodule GenStage do
         exit(reason)
       {:DOWN, ref, _, _, reason} ->
         if ref in keys do
-          send(parent, {{monitor_ref, ref}, {:down, reason}})
+          send(parent, {monitor_ref, {:DOWN, ref, reason}})
         end
         loop_monitor(parent, parent_ref, monitor_ref, keys -- [ref])
-    end
-  end
-
-  defp init_stream(subscriptions, options) do
-    parent = self()
-
-    {monitor_pid, monitor_ref} =
-      spawn_monitor(fn -> init_monitor(parent, subscriptions) end)
-    send(monitor_pid, {parent, monitor_ref})
-
-    receive do
-      {:DOWN, ^monitor_ref, _, _, reason} ->
-        exit(reason)
-      {^monitor_ref, {:subscriptions, subscriptions}} ->
-        producers = options[:producers] || Enum.map(subscriptions, fn
-          {_, {:subscribed, pid, _, _, _, _}} -> pid
-        end)
-        for pid <- producers, do: demand(pid, :forward)
-        {:receive, monitor_ref, subscriptions}
     end
   end
 
@@ -1097,7 +1398,7 @@ defmodule GenStage do
     receive_stream(monitor_ref, subscriptions)
   end
   defp consume_stream({:ask, from, ask, batches, monitor_ref, subscriptions}) do
-    ask > 0 and ask(from, ask, [:noconnect])
+    ask(from, ask, [:noconnect])
     deliver_stream(batches, from, monitor_ref, subscriptions)
   end
 
@@ -1149,7 +1450,7 @@ defmodule GenStage do
       {:"$gen_consumer", {_, {^monitor_ref, inner_ref}}, {:cancel, _} = reason} ->
         cancel_stream(inner_ref, reason, monitor_ref, subscriptions)
 
-      {{^monitor_ref, inner_ref}, {:down, reason}} ->
+      {^monitor_ref, {:DOWN, inner_ref, reason}} ->
         cancel_stream(inner_ref, reason, monitor_ref, subscriptions)
     end
   end
@@ -1442,7 +1743,6 @@ defmodule GenStage do
                   %{type: :consumer, producers: producers, mod: mod, state: state} = stage) when is_list(events) do
     case producers do
       %{^ref => entry} ->
-        {producer_pid, _, _} = entry
         {batches, stage} = consumer_receive(from, entry, events, stage)
         {_, reply} = consumer_dispatch(batches, from, mod, state, stage, 0, false)
         reply
@@ -1882,11 +2182,11 @@ defmodule GenStage do
     case mod.handle_events(batch, from, state) do
       {:noreply, events, state} when is_list(events) ->
         stage = dispatch_events(events, stage)
-        ask > 0 and ask(from, ask, [:noconnect])
+        ask(from, ask, [:noconnect])
         consumer_dispatch(batches, from, mod, state, stage, count + length(events), false)
       {:noreply, events, state, :hibernate} when is_list(events) ->
         stage = dispatch_events(events, stage)
-        ask > 0 and ask(from, ask, [:noconnect])
+        ask(from, ask, [:noconnect])
         consumer_dispatch(batches, from, mod, state, stage, count + length(events), true)
       {:stop, reason, state} ->
         {count, {:stop, reason, %{stage | state: state}}}
@@ -1912,16 +2212,16 @@ defmodule GenStage do
     {:reply, {:error, :not_a_consumer}, stage}
   end
 
-  defp consumer_subscribe(to, full_opts, stage) do
-    with {:ok, cancel, opts} <- validate_in(full_opts, :cancel, :permanent, [:temporary, :permanent]),
-         {:ok, max, opts} <- validate_integer(opts, :max_demand, 1000, 1, :infinity, false),
-         {:ok, min, opts} <- validate_integer(opts, :min_demand, div(max, 2), 0, max - 1, false) do
+  defp consumer_subscribe(to, opts, stage) do
+    with {:ok, cancel, _} <- validate_in(opts, :cancel, :permanent, [:temporary, :permanent]),
+         {:ok, max, _} <- validate_integer(opts, :max_demand, 1000, 1, :infinity, false),
+         {:ok, min, _} <- validate_integer(opts, :min_demand, div(max, 2), 0, max - 1, false) do
       producer_pid = GenServer.whereis(to)
       cond do
         producer_pid != nil ->
           ref = Process.monitor(producer_pid)
           send_noconnect(producer_pid, {:"$gen_producer", {self(), ref}, {:subscribe, opts}})
-          consumer_subscribe(full_opts, ref, producer_pid, cancel, min, max, stage)
+          consumer_subscribe(opts, ref, producer_pid, cancel, min, max, stage)
         cancel == :temporary ->
           {:reply, {:ok, make_ref()}, stage}
         cancel == :permanent ->
@@ -1985,7 +2285,7 @@ defmodule GenStage do
         consumer_dispatch(batches, from, mod, state, stage, 0, false)
       %{} ->
         # We queued but producer was removed
-        consumer_dispatch([{events, 0}], :unused, mod, state, stage, 0, false)
+        consumer_dispatch([{events, 0}], {:pid, :ref}, mod, state, stage, 0, false)
     end
   end
 

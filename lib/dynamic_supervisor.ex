@@ -19,7 +19,7 @@ defmodule DynamicSupervisor do
 
   ## Example
 
-  Before we start our dymamic supervisor, let's first build an agent
+  Before we start our dynamic supervisor, let's first build an agent
   that represents a stack. That's the process we will start dynamically:
 
       defmodule Stack do
@@ -40,9 +40,9 @@ defmodule DynamicSupervisor do
   supervisor, the dynamic supervisor expects a list of child
   specifications on start. Different from regular supervisors,
   this list must contain only one item. The child specified in
-  the list won't be started alongside the supervisor, instead,
+  the list won't be started alongside the supervisor. Instead,
   the child specification will be used as a template for all
-  future supervisor children.
+  future supervised children.
 
   Let's give it a try:
 
@@ -60,7 +60,7 @@ defmodule DynamicSupervisor do
       {:ok, sup} = DynamicSupervisor.start_link(children, strategy: :one_for_one)
 
   With the supervisor up and running, let's start our first
-  children with `DynamicSupervisor.start_child/2`. `start_child/2`
+  child with `DynamicSupervisor.start_child/2`. `start_child/2`
   expects the supervisor PID and a list of arguments. Let's start
   our child with a default stack of `[:hello]`:
 
@@ -101,9 +101,9 @@ defmodule DynamicSupervisor do
       Stack.pop(stack) #=> :hello
 
   In practice though, it is unlikely we would use `children/1`.
-  When we are managing thousands up to million of processes, we
+  When we are managing thousands to millions of processes, we
   must find more efficient ways to retrieve processes. We have a
-  couple options.
+  couple of options.
 
   The first option is to ask if we really want the stack to be
   automatically restarted. If not, we can choose another restart
@@ -127,7 +127,7 @@ defmodule DynamicSupervisor do
       #=> [:hello]
 
   And that's it. If the stack crashes, another stack will be up and
-  register itself with name `MyStack`.
+  have registered itself with the name `MyStack`.
 
   ## Module-based supervisors
 
@@ -152,7 +152,7 @@ defmodule DynamicSupervisor do
       end
 
   **Note:** differently from `Supervisor`, the `DynamicSupervisor`
-  expects a 3-item tuple as result from `init/1` and it does not
+  expects a 3-item tuple from `init/1` and it does not
   use the `supervise/2` function. The goal is to standardize both
   implementations in the long term.
 
@@ -167,10 +167,28 @@ defmodule DynamicSupervisor do
     * `:one_for_one` - if a child process terminates, only that
       process is restarted.
 
+  ## GenStage consumer
+
+  A `DynamicSupervisor` can be used as the consumer in a `GenStage` pipeline.
+  A new child process will be started per event, where the event is appended
+  to the arguments in the child specification.
+
+  A `DynamicSupervisor` can be attached to a producer by returning
+  `:subscribe_to` from `init/1` or explicitly with `GenStage.sync_subscribe/3`
+  and `GenStage.async_subscribe/2`.
+
+  Once subscribed, the supervisor will ask the producer for `max_demand` events
+  and start child processes as events arrive. As child process terminate, the
+  supervisor will accumulate demand and request for more events once `min_demand`
+  is reached. This allows the `DynamicSupervisor` to work similar to a pool,
+  except a child process is started per event. The minimum amount of concurrent
+  children per producer is specified by `min_demand` and the `maximum` is given
+  by `max_demand`.
+
   ## Exit reasons
 
   From the example above, you may have noticed that the transient restart
-  strategy for the worker does not restart the child in case it crashes with
+  strategy for the worker does not restart the child if it crashes with
   reason `:normal`, `:shutdown` or `{:shutdown, term}`.
 
   So one may ask: which exit reason should I choose when exiting my worker?
@@ -191,18 +209,6 @@ defmodule DynamicSupervisor do
 
   A supervisor is bound to the same name registration rules as a `GenServer`.
   Read more about it in the `GenServer` docs.
-
-  ## GenStage consumer
-
-  A `DynamicSupervisor` can be used as the consumer in a `GenStage` pipeline.
-  Each event will be appended to the arguments in the child specification.
-
-  A `DynamicSupervisor` can be attached to a producer by returning
-  `:subscribe_to` from `init/1` or explicitly with `GenStage.sync_subscribe/3`
-  and `GenStage.async_subscribe/2`. Each producer will be limit to starting
-  `max_demand` concurrent children. Therefore the number of concurrent children
-  from an individual producer must fall below `max_demand` before more arguments
-  will be demanded from that producer.
   """
 
   @behaviour GenStage
@@ -230,14 +236,14 @@ defmodule DynamicSupervisor do
       in seconds. Defaults to 5 seconds.
 
     * `:max_dynamic` - the maximum number of children started under the
-      supervisor. Default to infinity children.
+      supervisor via `start_child/2`. Default to infinity children.
 
     * `:subscribe_to` - a list of producers to subscribe to. Each element
       represents the producer or a tuple with the producer and the subscription
       options
   """
   @callback init(args :: term) ::
-    {:ok, [Supervisor.Spec.spec], options :: Keyword.t} | :ignore
+    {:ok, [Supervisor.Spec.spec], options :: keyword()} | :ignore
 
   defstruct [:name, :mod, :args, :template, :max_restarts, :max_seconds, :strategy,
              :max_dynamic, children: %{}, producers: %{}, restarts: [],

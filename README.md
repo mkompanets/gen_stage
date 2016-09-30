@@ -6,11 +6,11 @@ This project currently provides the following functionality:
 
   * `Experimental.GenStage` ([docs](https://hexdocs.pm/gen_stage/Experimental.GenStage.html)) - a behaviour for implementing producer and consumer stages
 
-  * `Experimental.GenStage.Flow` ([docs](https://hexdocs.pm/gen_stage/Experimental.GenStage.Flow.html)) - `GenStage.Flow` allows developers to express computations on collections, similar to the `Enum` and `Stream` modules, although computations will be executed in parallel using multiple `GenStage`s
+  * `Experimental.Flow` ([docs](https://hexdocs.pm/gen_stage/Experimental.Flow.html)) - `Flow` allows developers to express computations on collections, similar to the `Enum` and `Stream` modules, although computations will be executed in parallel using multiple `GenStage`s
 
   * `Experimental.DynamicSupervisor` ([docs](https://hexdocs.pm/gen_stage/Experimental.DynamicSupervisor.html)) - a supervisor designed for starting children dynamically. Besides being a replacement for the `:simple_one_for_one` strategy in the regular `Supervisor`, a `DynamicSupervisor` can also be used as a stage consumer, making it straight-forward to spawn a new process for every event in a stage pipeline
 
-The module names are marked as `Experimental` to avoid conflicts as they are meant to be included in future Elixir releases. In your code, you may add `alias Experimental.{DynamicSupervisor, GenStage}` to the top of your files and use the relative names from then on.
+The module names are marked as `Experimental` to avoid conflicts as they are meant to be included in future Elixir releases. In your code, you may add `alias Experimental.{DynamicSupervisor, Flow, GenStage}` to the top of your files and use the relative names from then on.
 
 You can find examples on how to use the modules above in the [examples](examples) directory:
 
@@ -36,26 +36,11 @@ GenStage requires Elixir v1.3.
           [applications: [:gen_stage]]
         end
 
-## Future research
+## Future integration
 
 Here is a list of potential topics to be explored by this project (in no particular order or guarantee):
 
   * Consider using DynamicSupervisor to implement Task.Supervisor (as a consumer)
-
-  * TCP and UDP acceptors as producers
-
-  * Explore different windowing strategies - the ideas behind the Apache Beam project are interesting, specially the mechanism that divides operations between what/where/when/how (1, 2) as well as windowing from the perspective of aggregation (3)
-
-Other research topics include the Titan (4), Naiad's Differential Dataflow engine (5) and Lasp (6).
-
-### Links
-
-  1. https://cloud.google.com/blog/big-data/2016/05/why-apache-beam-a-google-perspective
-  2. http://www.vldb.org/pvldb/vol8/p1792-Akidau.pdf
-  3. http://www.vldb.org/pvldb/vol8/p702-tangwongsan.pdf
-  4. http://asc.di.fct.unl.pt/~nmp/pubs/clouddp-2013.pdf
-  5. http://research-srv.microsoft.com/pubs/176693/differentialdataflow.pdf
-  6. https://lasp-lang.org/
 
 ## License
 

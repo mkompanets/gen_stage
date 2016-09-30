@@ -12,13 +12,21 @@ defmodule GenStage.PartitionDispatcher do
   The partition dispatcher accepts the following options
   on initialization:
 
-    * `:partitions` - a required option that sets the number
-      of partitions we will dispatch to
+    * `:partitions` - an eumerable that sets the names of the partitions
+      we will dispatch to.
 
-    * `:hash` - the hashing algorithm, defaults to `:erlang.phash2/2`
-      which receives the message and the number of partitions and
-      it must the event to be dispatched and a number between 0 and
-      `number_of_partitions - 1`
+    * `:hash` - the hashing algorithm, which receives the event and returns
+      the event and partition in a 2 element tuple. The default uses
+      `&:erlang.phash2(&1, Enum.count(partitions))` on the event to select
+      the partition.
+
+  ## Subscribe options
+
+  When subscribing to a `GenStage` with a partition dispatcher the following
+  option is required:
+
+    * `:partition` - the name of the partition, must be included in the
+      `:partitions` enumerable set on initialization of the dispatcher.
   """
 
   @behaviour GenStage.Dispatcher
@@ -26,16 +34,17 @@ defmodule GenStage.PartitionDispatcher do
 
   @doc false
   def init(opts) do
-    hash = Keyword.get(opts, :hash, &hash/2)
-    max  = Keyword.get(opts, :partitions) ||
-             raise ArgumentError, "the number of :partitions is required when using the partition dispatcher"
+    partitions = Keyword.get(opts, :partitions) ||
+             raise ArgumentError, "the enumerable of :partitions is required when using the partition dispatcher"
 
-    partitions = for i <- 0..max-1, do: {i, @init}, into: %{}
+    partitions = for i <- partitions, do: {i, @init}, into: %{}
+    range = map_size(partitions)
+    hash = Keyword.get(opts, :hash, &hash(&1, range))
     {:ok, {make_ref(), hash, 0, 0, partitions, %{}}}
   end
 
-  defp hash(event, count) do
-    {event, :erlang.phash2(event, count)}
+  defp hash(event, range) do
+    {event, :erlang.phash2(event, range)}
   end
 
   @doc false
@@ -67,7 +76,11 @@ defmodule GenStage.PartitionDispatcher do
       _ when is_nil(partition) ->
         raise ArgumentError, "the :partition option is required when subscribing to a producer with partition dispatcher"
       _ ->
-        raise ArgumentError, ":partition must be an integer between 0..#{map_size(partitions)-1}, got: #{partition}"
+        keys =
+          partitions
+          |> Map.keys()
+          |> Enum.join(", ")
+        raise ArgumentError, ":partition must be one of #{keys} but got: #{partition}"
     end
   end
 
@@ -80,7 +93,7 @@ defmodule GenStage.PartitionDispatcher do
       demand when is_integer(demand) ->
         {:ok, 0, {tag, hash, waiting, pending + demand, partitions, references}}
       queue ->
-        length = :queue.len(queue) # TODO: Do not count notifications
+        length = count_from_queue(queue, tag, 0)
         {:ok, length, {tag, hash, waiting + length, pending, partitions, references}}
     end
   end
@@ -122,6 +135,17 @@ defmodule GenStage.PartitionDispatcher do
     end
   end
 
+  defp count_from_queue(queue, tag, counter) do
+    case :queue.out(queue) do
+      {{:value, {^tag, _}}, queue} ->
+        count_from_queue(queue, tag, counter)
+      {{:value, _}, queue} ->
+        count_from_queue(queue, tag, counter + 1)
+      {:empty, _queue} ->
+        counter
+    end
+  end
+
   # Important: events must be in reverse order
   defp maybe_send([], _pid, _ref),
     do: :ok
@@ -137,7 +161,7 @@ defmodule GenStage.PartitionDispatcher do
     countdown size, nil, fn i, nil -> Process.put(i, []) end
 
     for event <- deliver_now do
-      {event, partition} = hash.(event, size)
+      {event, partition} = hash.(event)
       Process.put(partition, [event | Process.get(partition)])
     end
 
